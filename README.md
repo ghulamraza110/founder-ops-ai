@@ -47,18 +47,38 @@ No LLM; the results are fully deterministic.
 
 ### Two ways to start a case
 
-- **Chat** (UI "Chat" tab, or `POST /cases/{id}/chat`): the full three-agent graph. The locked terms are copied onto the case and its founders in the database.
+- **Chat** (UI "New case from chat", or `POST /cases/chat`): the full three-agent graph. The locked terms are copied onto the case and its founders in the database.
 - **Form** (UI "Founders" tab, then `POST /cases/{id}/run`): you enter founders by hand. The same Python checks run, then both builders. No LLM is used to read the terms.
 
-### Approvals and status
+### Multi-party sign-off ([app/state_machine.py](app/state_machine.py))
+
+Each document has a `version` (starting at 1) and `approvals`, which maps each founder's name to the version they signed, or `null`. This part is plain Python, with no LLM.
+
+```
+DRAFT ──approve──> PENDING_APPROVAL ──every founder signed the current version──> EXECUTED
+  │                   │      ▲                                                        │
+  └──edit─────────────┴──> INVALIDATED ──(signatures reset)──┘ <─────────edit──────────┘
+```
+
+- **Approve** sets `approvals[founder] = version`. The document becomes `EXECUTED` once every founder has signed the current version; until then it stays `PENDING_APPROVAL`. Approving twice changes nothing.
+- **Edit** saves new Markdown and adds 1 to the version.
+  - Every other founder's approval is reset to `null`. The editor's own approval moves to the new version, because editing counts as signing it.
+  - The document passes through `INVALIDATED` and back to `PENDING_APPROVAL`. (A sole founder's edit goes straight to `EXECUTED`.)
+  - An audit entry records who edited, the version change and whose signatures were invalidated, for example:
+    `{"document": "Corporate Bylaws Summary", "version": "v1 -> v2", "edited_by": "Bob Lee", "invalidated_signatures": ["Alice Khan"]}`
+  - Editing an `EXECUTED` document is allowed. It invalidates the other signatures in the same way.
+- **Redrafting:** if the agents run again (a new chat message after the terms were locked, or the form's run button), each document gets a new version of the same record and **every** signature is reset.
+- **Who can act:** only the case's founders can approve or edit. Anyone else gets HTTP 400.
+- **Every status change** is written to the audit log.
+
+### Case status
 
 ```
 intake ──> needs_info         (missing or invalid terms; answer the questions or fix the founders, then retry)
-       ──> awaiting_approval ──every founder approves every document──> ready_to_file
+       ──> awaiting_approval ──every document EXECUTED──> ready_to_file
 ```
 
-- A document is `approved` once every founder has approved it. Founders are identified by email, or by name if no email is on file.
-- Running the workflow again saves new document versions (v2, v3, …) and keeps the old ones. The case is `ready_to_file` when the latest version of every document is approved.
+If a document is edited after the case reached `ready_to_file`, the case goes back to `awaiting_approval`.
 
 ## Project structure
 
@@ -73,7 +93,8 @@ app/
     legal_drafter.py     Builder 1: LLM-drafted legal documents
     cap_table_builder.py Builder 2: shares, vesting schedule, CSV/Excel/JSON export
     graph.py             The three-agent LangGraph graph
-  state_machine.py       Entry points the API calls (chat and form), SQLite chat memory
+  workflow.py            Entry points the API calls (chat and form), SQLite chat memory
+  state_machine.py       Multi-party sign-off: approve, edit, DRAFT/PENDING_APPROVAL/INVALIDATED/EXECUTED
   main.py                FastAPI app; creates the database on startup
 ui/
   streamlit_app.py       Streamlit front end
@@ -164,35 +185,53 @@ The command-line tester saves its files to `exports/<company-name>/`. The API sa
 
 | Method | Path | Description |
 |---|---|---|
+| POST | `/cases/chat` | `{"message": "...", "case_id": 1}` runs the Manager/Builder graph on Groq. Leave out `case_id` to start a new case; the response includes it. |
+| GET | `/cases/{id}` | Everything about a case: terms, 83(b) deadline, cap table, documents (status, version, approvals, pending signers) and the audit log |
+| POST | `/documents/{id}/approve` | `{"founder_name": "Alice Khan"}` signs the current version |
+| POST | `/documents/{id}/edit` | `{"founder_name": "Bob Lee", "content_md": "..."}` saves a new version; returns the document and `invalidated_signatures` |
+| GET | `/cases/{id}/cap-table/download` | `?format=xlsx` (default), `csv`, `vesting_csv` or `json` |
 | GET | `/health` | Health check |
-| POST | `/cases` | Create a case (every field optional for a chat-first case) |
+| POST | `/cases` | Create an empty case (form path) |
 | GET | `/cases` | List cases |
-| GET | `/cases/{id}` | Case details, including founders |
-| POST | `/cases/{id}/founders` | Add a founder (form path) |
-| POST | `/cases/{id}/chat` | Send `{"message": "..."}` to the Manager Agent; the builders run once the terms are ready |
-| GET | `/cases/{id}/chat` | Chat history |
+| POST | `/cases/{id}/founders` | Add a founder (form path; names must be unique) |
 | POST | `/cases/{id}/run` | Form path: validate the founders, then run both builders |
-| GET | `/cases/{id}/cap-table` | Cap table JSON summary |
+| GET | `/cases/{id}/chat` | Chat history |
 | GET | `/cases/{id}/exports` | List generated files |
-| GET | `/cases/{id}/exports/{file}` | Download one file (CSV, XLSX, JSON, MD) |
-| GET | `/cases/{id}/documents` | List all document versions |
-| POST | `/documents/{id}/approve` | Approve as `{"approver": "<founder email or name>"}` |
-| GET | `/cases/{id}/audit` | Audit log (founder, Manager Agent, builders and approvals) |
+| GET | `/cases/{id}/exports/{file}` | Download one generated file (including the Markdown documents) |
+
+The first five are the main endpoints; the rest support the form path and the UI.
 
 If the LLM provider fails (no balance, rate limit, missing key), the API returns HTTP 502 with the provider's error message.
 
 ## What has been tested
 
 - **Logic checks** (`test_graph.py --unit`, 11/11 passing): equity validation, required-field questions, cliff longer than vesting, default vesting, the 83(b) date (including across a year end), 6,000,000/4,000,000 shares for a 60/40 split, an exact 10,000,000 total for a three-way split, and the cliff and full-vesting dates.
-- **Full API flow** (23/23 passing, with the LLM replaced by a stub so no credits were spent): a chat that needs more information, then one that locks the terms; case and founders copied from the chat; chat history kept after a restart; cap table and Excel download; approvals by email and by name; `ready_to_file`; form path with an LLC (units, its own state); exports kept separate per case; HTTP 502 on an LLM error; unknown files blocked.
-- **Live with Groq:** the scripted demo and a Streamlit chat session both ran end to end. The first message got the two expected follow-up questions (missing date; equity at 90%). The second locked the terms with the 83(b) deadline set to 2026-12-31, drafted all three documents, and produced the cap table with 7 downloadable files. No errors appeared in the UI.
+- **Full API flow** (23/23 passing, with the LLM replaced by a stub so no credits were spent): a chat that needs more information, then one that locks the terms; case and founders copied from the chat; chat history kept after a restart; cap table and Excel download; `ready_to_file`; form path with an LLC (units, its own state); exports kept separate per case; HTTP 502 on an LLM error; unknown files blocked.
+- **Sign-off state machine** (37/37 passing, LLM stubbed):
+  - new documents start as `DRAFT` at v1 with every approval `null`
+  - a partial sign-off stays `PENDING_APPROVAL`; approving twice changes nothing
+  - an edit bumps the version, resets the other founders, keeps the editor's signature and lists who lost theirs
+  - the audit log shows who edited, whose signatures were invalidated, and the `INVALIDATED -> PENDING_APPROVAL` step
+  - signatures on an old version don't count
+  - `EXECUTED` once all founders sign the new version, and editing an `EXECUTED` document re-opens it
+  - all documents `EXECUTED` makes the case `ready_to_file`, and a later edit sends it back to `awaiting_approval`
+  - redrafting keeps the same document record and resets every signature
+  - a sole founder's edit executes immediately
+  - non-founders, empty edits and unchanged edits are rejected
+  - cap table downloads work in all four formats
+- **Live with Groq** (real API server and Streamlit UI):
+  - The first message got the two expected follow-up questions (missing date; equity at 90%).
+  - The second locked the terms with the 83(b) deadline set to 2026-12-31, drafted all three documents, and produced the cap table.
+  - In the UI, Alice approved the Bylaws. Bob then edited them, which moved them to v2, reset Alice's signature and wrote the audit entry shown above.
+  - No errors appeared in the UI.
 - **DeepSeek:** the key is accepted, but the account has no balance yet (HTTP 402).
 
-The API flow test ran from a temporary script; it isn't committed as a test suite yet.
+The API and sign-off tests ran from temporary scripts; they aren't committed as a test suite yet.
 
 ## Known limitations
 
 - **US only:** Delaware C-Corp or LLC. Pakistan (SECP) and other countries aren't supported.
-- **No authentication:** anyone using the UI can approve as any founder.
+- **No authentication:** anyone using the API or UI can approve or edit as any founder by passing their name. A real deployment would need login and e-signatures.
+- **Old databases:** documents created before this change, with list-style approvals and lowercase statuses, are read as unsigned `DRAFT`. Delete `founder_ops.db` for a clean start.
 - **Database:** SQLite only, and tables are created with `create_all` (no migrations).
 - **Outdated files:** re-running the workflow overwrites the files in `exports/`. Older document versions stay in the database.

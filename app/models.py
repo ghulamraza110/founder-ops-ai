@@ -59,8 +59,9 @@ class Document(Base):
     doc_type: Mapped[str] = mapped_column(String(100))
     version: Mapped[int] = mapped_column(Integer, default=1)
     content_md: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(50), default="draft")
-    approvals_json: Mapped[str] = mapped_column(Text, default="[]")
+    status: Mapped[str] = mapped_column(String(50), default="DRAFT")
+    # {"<founder name>": <version signed> | null}
+    approvals_json: Mapped[str] = mapped_column(Text, default="{}")
 
     case: Mapped[StartupCase] = relationship(back_populates="documents")
 

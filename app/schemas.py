@@ -42,18 +42,29 @@ class CaseDetail(CaseOut):
     founders: list[FounderOut] = []
 
 
-class DocumentOut(ORMModel):
+class DocumentOut(BaseModel):
     id: int
     case_id: int
     doc_type: str
     version: int
     content_md: str
-    status: str
-    approvals_json: str
+    status: Literal["DRAFT", "PENDING_APPROVAL", "INVALIDATED", "EXECUTED"]
+    approvals: dict[str, int | None]  # founder_name -> version signed, or None
+    pending: list[str]                # founders who still need to sign the current version
 
 
 class ApprovalIn(BaseModel):
-    approver: str = Field(description="Founder email, or name if no email is on file")
+    founder_name: str
+
+
+class EditIn(BaseModel):
+    founder_name: str
+    content_md: str = Field(min_length=1)
+
+
+class EditOut(BaseModel):
+    document: DocumentOut
+    invalidated_signatures: list[str]
 
 
 class AuditLogOut(ORMModel):
@@ -67,6 +78,7 @@ class AuditLogOut(ORMModel):
 
 class ChatIn(BaseModel):
     message: str = Field(min_length=1)
+    case_id: int | None = Field(default=None, description="Omit to start a new case")
 
 
 class ChatMessage(BaseModel):
@@ -84,3 +96,12 @@ class WorkflowResult(BaseModel):
     deadline_83b: date | None = None
     documents: list[str] = []
     export_files: list[str] = []
+
+
+class CaseFull(CaseOut):
+    founders: list[FounderOut]
+    terms: dict | None            # locked/extracted startup terms
+    deadline_83b: date | None
+    cap_table: dict | None        # JSON summary, None until the builders have run
+    documents: list[DocumentOut]
+    audit_logs: list[AuditLogOut]
