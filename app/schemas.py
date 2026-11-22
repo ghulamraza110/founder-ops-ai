@@ -1,5 +1,6 @@
 """Pydantic v2 request/response schemas."""
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,9 +11,9 @@ class ORMModel(BaseModel):
 
 class FounderCreate(BaseModel):
     name: str
-    email: str
+    email: str = ""
     equity_percent: float = Field(gt=0, le=100)
-    vesting_months: int = Field(default=48, ge=0)
+    vesting_months: int = Field(default=48, ge=1)
     cliff_months: int = Field(default=12, ge=0)
 
 
@@ -22,8 +23,8 @@ class FounderOut(ORMModel, FounderCreate):
 
 
 class CaseCreate(BaseModel):
-    name: str
-    entity_type: str = "C-Corp"
+    name: str = "Untitled startup"
+    entity_type: Literal["Delaware C-Corp", "LLC"] = "Delaware C-Corp"
     state: str = "Delaware"
     incorporation_date: date | None = None
 
@@ -52,7 +53,7 @@ class DocumentOut(ORMModel):
 
 
 class ApprovalIn(BaseModel):
-    approver: str
+    approver: str = Field(description="Founder email, or name if no email is on file")
 
 
 class AuditLogOut(ORMModel):
@@ -64,8 +65,22 @@ class AuditLogOut(ORMModel):
     timestamp: datetime
 
 
-class RunResult(BaseModel):
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1)
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class WorkflowResult(BaseModel):
     case_id: int
     status: str
-    issues: list[str] = []
+    terms_ready: bool
+    questions: list[str] = []
+    reply: str | None = None          # Manager Agent's message (chat only)
+    terms: dict | None = None         # extracted terms so far (chat only)
+    deadline_83b: date | None = None
     documents: list[str] = []
+    export_files: list[str] = []

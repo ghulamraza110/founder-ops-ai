@@ -27,7 +27,7 @@ class StartupCase(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
-    entity_type: Mapped[str] = mapped_column(String(50), default="C-Corp")
+    entity_type: Mapped[str] = mapped_column(String(50), default="Delaware C-Corp")
     state: Mapped[str] = mapped_column(String(50), default="Delaware")
     incorporation_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="intake")
