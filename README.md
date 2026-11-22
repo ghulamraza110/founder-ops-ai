@@ -70,6 +70,9 @@ DRAFT ──approve──> PENDING_APPROVAL ──every founder signed the curre
 - **Redrafting:** if the agents run again (a new chat message after the terms were locked, or the form's run button), each document gets a new version of the same record and **every** signature is reset.
 - **Who can act:** only the case's founders can approve or edit. Anyone else gets HTTP 400.
 - **Every status change** is written to the audit log.
+- **Conflicts:** approve and edit carry the version the founder was looking at (`version` / `base_version`). If the document has moved on, the API returns **HTTP 409** and changes nothing. Truly simultaneous requests are caught by database-level optimistic locking.
+
+Why it works this way, and how edit conflicts are handled, is written up in [ADR-001-signoff-state-machine.md](ADR-001-signoff-state-machine.md).
 
 ### Case status
 
@@ -99,6 +102,7 @@ app/
 ui/
   streamlit_app.py       Streamlit front end
 test_graph.py            Command-line tester for the graph
+ADR-001-signoff-state-machine.md  Design record for the sign-off state machine
 exports/                 Generated files, one folder per case (git-ignored)
 .env.example             Template for your settings
 requirements.txt
@@ -168,7 +172,32 @@ streamlit run ui/streamlit_app.py
 ```
 
 - API: http://localhost:8000 (interactive docs at `/docs`)
-- UI: http://localhost:8501. Click **New case from chat** and describe your startup.
+- UI: http://localhost:8501
+
+### Demo walkthrough
+
+The UI ([ui/streamlit_app.py](ui/streamlit_app.py)) has a sidebar and four tabs:
+
+- **Sidebar:**
+  - **Active User** switcher (Founder A / Founder B / …). Approvals and edits are made as this founder.
+  - **Compliance Deadlines** panel: a countdown of days left to file the 83(b) election, the 30-day progress, the 83(b) form's sign-off status and the next vesting cliff.
+- **Manager Chat:** negotiate entity type, equity and vesting with the Manager Agent. The tab shows which LLM is active (from `/health`).
+- **Cap Table:** shares, ownership %, shares vested today, a month-by-month vesting schedule per founder, and Download CSV / Excel buttons.
+- **Document Review & Sign-Off:**
+  - Pick a document to see its version, status badge and each founder's signature.
+  - **Approve as [Active User]** signs the current version.
+  - **Edit Clause** lets you rewrite one section. Saving creates the next version, and the other founder's card turns to ❌ "Signature invalidated by …'s edit".
+- **Audit Trail:** every approval, edit, signature invalidation and status change, oldest first, with filters.
+
+A 3-minute demo:
+
+1. Click **New case** and paste the example prompt shown on screen. The Manager Agent asks for the missing date and points out that equity adds to 90%.
+2. Reply: `Bob has 40%. Incorporation date 2026-12-01.` The terms lock, the 83(b) countdown appears, and the documents and cap table are generated.
+3. **Cap Table:** show the 6,000,000 / 4,000,000 split and the vesting schedule, then download the Excel file.
+4. **Document Review:** as Founder A, approve the Bylaws.
+5. Switch to Founder B, edit a clause and save. Founder A's signature turns to ❌ invalidated, and the document is now v2.
+6. **Audit Trail:** show the approval, the edit and the invalidation.
+7. Switch back to A and approve. Then, as B, approve too: the document becomes **EXECUTED**.
 
 ### Command-line tester
 
@@ -187,10 +216,10 @@ The command-line tester saves its files to `exports/<company-name>/`. The API sa
 |---|---|---|
 | POST | `/cases/chat` | `{"message": "...", "case_id": 1}` runs the Manager/Builder graph on Groq. Leave out `case_id` to start a new case; the response includes it. |
 | GET | `/cases/{id}` | Everything about a case: terms, 83(b) deadline, cap table, documents (status, version, approvals, pending signers) and the audit log |
-| POST | `/documents/{id}/approve` | `{"founder_name": "Alice Khan"}` signs the current version |
-| POST | `/documents/{id}/edit` | `{"founder_name": "Bob Lee", "content_md": "..."}` saves a new version; returns the document and `invalidated_signatures` |
+| POST | `/documents/{id}/approve` | `{"founder_name": "Alice Khan", "version": 1}` signs that version; 409 if the document has moved on |
+| POST | `/documents/{id}/edit` | `{"founder_name": "Bob Lee", "content_md": "...", "base_version": 1}` saves a new version; returns the document and `invalidated_signatures`; 409 if `base_version` is stale |
 | GET | `/cases/{id}/cap-table/download` | `?format=xlsx` (default), `csv`, `vesting_csv` or `json` |
-| GET | `/health` | Health check |
+| GET | `/health` | Health check, plus the active LLM provider and model |
 | POST | `/cases` | Create an empty case (form path) |
 | GET | `/cases` | List cases |
 | POST | `/cases/{id}/founders` | Add a founder (form path; names must be unique) |
@@ -207,7 +236,7 @@ If the LLM provider fails (no balance, rate limit, missing key), the API returns
 
 - **Logic checks** (`test_graph.py --unit`, 11/11 passing): equity validation, required-field questions, cliff longer than vesting, default vesting, the 83(b) date (including across a year end), 6,000,000/4,000,000 shares for a 60/40 split, an exact 10,000,000 total for a three-way split, and the cliff and full-vesting dates.
 - **Full API flow** (23/23 passing, with the LLM replaced by a stub so no credits were spent): a chat that needs more information, then one that locks the terms; case and founders copied from the chat; chat history kept after a restart; cap table and Excel download; `ready_to_file`; form path with an LLC (units, its own state); exports kept separate per case; HTTP 502 on an LLM error; unknown files blocked.
-- **Sign-off state machine** (37/37 passing, LLM stubbed):
+- **Sign-off state machine** (43/43 passing, LLM stubbed):
   - new documents start as `DRAFT` at v1 with every approval `null`
   - a partial sign-off stays `PENDING_APPROVAL`; approving twice changes nothing
   - an edit bumps the version, resets the other founders, keeps the editor's signature and lists who lost theirs
@@ -219,10 +248,14 @@ If the LLM provider fails (no balance, rate limit, missing key), the API returns
   - a sole founder's edit executes immediately
   - non-founders, empty edits and unchanged edits are rejected
   - cap table downloads work in all four formats
-- **Live with Groq** (real API server and Streamlit UI):
-  - The first message got the two expected follow-up questions (missing date; equity at 90%).
-  - The second locked the terms with the 83(b) deadline set to 2026-12-31, drafted all three documents, and produced the cap table.
-  - In the UI, Alice approved the Bylaws. Bob then edited them, which moved them to v2, reset Alice's signature and wrote the audit entry shown above.
+  - approving or editing a stale version returns 409 and changes nothing
+  - a true race (two sessions, one edits while the other approves) raises a conflict instead of applying the stale signature
+- **Live demo with Groq** (real API server driving the Streamlit UI):
+  - The first message got the two expected follow-up questions.
+  - The second locked the terms. The sidebar showed the 83(b) countdown ("28 days left", due Dec 20, 2026) and the next cliff date.
+  - Cap Table showed 10,000,000 shares and the three download buttons.
+  - Founder A approved the Bylaws. The switcher was moved to Founder B, who edited a clause and saved v2. Founder A's card turned to "Signature invalidated by Bob Lee's edit (v1 → v2)".
+  - Audit Trail listed the approval, the edit, the invalidation and every status change in order.
   - No errors appeared in the UI.
 - **DeepSeek:** the key is accepted, but the account has no balance yet (HTTP 402).
 

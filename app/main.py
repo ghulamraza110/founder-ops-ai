@@ -4,6 +4,7 @@ All LLM calls (Manager extraction, Legal Drafter) go through app/llm.py, which u
 LLM_PROVIDER=groq. Sign-off (approve/edit) is plain Python in app/state_machine.py.
 """
 import json
+import os
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -18,6 +19,7 @@ from app import schemas
 from app import state_machine as sm
 from app.agents.manager_agent import calculate_83b_deadline
 from app.agents.state import StartupTerms, export_dir
+from app.llm import PROVIDERS
 from app.models import AuditLog, Document, Founder, StartupCase, get_db, init_db, log_action
 from app.workflow import case_key, chat_history, chat_terms, run_chat, run_from_terms
 
@@ -85,6 +87,8 @@ def sign_off(fn, *args):
         return fn(*args)
     except LookupError as e:
         raise HTTPException(404, str(e))
+    except sm.VersionConflict as e:
+        raise HTTPException(409, str(e))
     except sm.SignOffError as e:
         raise HTTPException(400, str(e))
 
@@ -153,7 +157,9 @@ def save_results(db: Session, case: StartupCase, result: dict, sync_from_terms: 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    provider = os.getenv("LLM_PROVIDER", "deepseek").lower()
+    model = os.getenv("LLM_MODEL") or PROVIDERS.get(provider, {}).get("model")
+    return {"status": "ok", "llm_provider": provider, "llm_model": model}
 
 
 @app.post("/cases", response_model=schemas.CaseOut)
@@ -243,13 +249,14 @@ def run_case(case_id: int, db: Session = Depends(get_db)):
 @app.post("/documents/{doc_id}/approve", response_model=schemas.DocumentOut)
 def approve_document(doc_id: int, payload: schemas.ApprovalIn, db: Session = Depends(get_db)):
     """Founder signs the current version. EXECUTED once every founder has signed it."""
-    return doc_out(sign_off(sm.approve, db, doc_id, payload.founder_name))
+    return doc_out(sign_off(sm.approve, db, doc_id, payload.founder_name, payload.version))
 
 
 @app.post("/documents/{doc_id}/edit", response_model=schemas.EditOut)
 def edit_document(doc_id: int, payload: schemas.EditIn, db: Session = Depends(get_db)):
     """New version: every other founder's signature is reset and the change is audit-logged."""
-    doc, invalidated = sign_off(sm.edit_document, db, doc_id, payload.founder_name, payload.content_md)
+    doc, invalidated = sign_off(sm.edit_document, db, doc_id, payload.founder_name, payload.content_md,
+                                payload.base_version)
     return schemas.EditOut(document=doc_out(doc), invalidated_signatures=invalidated)
 
 

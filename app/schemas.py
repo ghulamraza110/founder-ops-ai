@@ -55,11 +55,13 @@ class DocumentOut(BaseModel):
 
 class ApprovalIn(BaseModel):
     founder_name: str
+    version: int | None = Field(default=None, description="Version being signed; 409 if the document has moved on")
 
 
 class EditIn(BaseModel):
     founder_name: str
     content_md: str = Field(min_length=1)
+    base_version: int | None = Field(default=None, description="Version the edit is based on; 409 if stale")
 
 
 class EditOut(BaseModel):

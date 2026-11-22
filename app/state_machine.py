@@ -12,6 +12,7 @@ import json
 from enum import StrEnum
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.models import Document, StartupCase, log_action
 
@@ -33,6 +34,10 @@ ALLOWED = {
 
 class SignOffError(ValueError):
     """Raised for an operation the state machine does not allow (mapped to HTTP 400)."""
+
+
+class VersionConflict(SignOffError):
+    """The document changed since the founder loaded it (mapped to HTTP 409)."""
 
 
 # ---------- helpers ----------
@@ -98,9 +103,9 @@ def _new_version(db: Session, doc: Document, content_md: str, editor: str | None
     invalidated = [n for n, v in before.items() if v is not None and n != editor]
     old_version = doc.version
 
+    _transition(db, doc, DocStatus.INVALIDATED, actor)  # logged against the old version
     doc.version += 1
     doc.content_md = content_md
-    _transition(db, doc, DocStatus.INVALIDATED, actor)
     approvals = {n: (doc.version if n == editor else None) for n in before}
     _set_approvals(doc, approvals)
 
@@ -134,11 +139,31 @@ def redraft_document(db: Session, doc: Document, content_md: str, actor: str) ->
     return doc
 
 
-def approve(db: Session, doc_id: int, founder_name: str) -> Document:
+def _check_version(doc: Document, expected: int | None, verb: str) -> None:
+    if expected is not None and expected != doc.version:
+        raise VersionConflict(
+            f"Cannot {verb} v{expected} of {doc.doc_type}: it is now v{doc.version}. "
+            "Reload and review the latest version first."
+        )
+
+
+def _commit(db: Session, doc: Document) -> None:
+    """Commit, turning a lost optimistic-lock race into a VersionConflict."""
+    try:
+        db.commit()
+    except StaleDataError:
+        db.rollback()
+        raise VersionConflict(f"{doc.doc_type} was changed by someone else just now. Reload and try again.")
+
+
+def approve(db: Session, doc_id: int, founder_name: str, expected_version: int | None = None) -> Document:
+    """Sign the current version. Pass `expected_version` (the version the founder read) so a
+    signature can never land on a version they have not seen."""
     doc = db.get(Document, doc_id)
     if not doc:
         raise LookupError("Document not found")
     _require_founder(doc, founder_name)
+    _check_version(doc, expected_version, "approve")
     if status_of(doc) == DocStatus.EXECUTED:
         return doc  # already fully signed; nothing to do
 
@@ -152,20 +177,24 @@ def approve(db: Session, doc_id: int, founder_name: str) -> Document:
     else:
         _transition(db, doc, DocStatus.PENDING_APPROVAL, founder_name)
     sync_case_status(doc.case)
-    db.commit()
+    _commit(db, doc)
     return doc
 
 
-def edit_document(db: Session, doc_id: int, founder_name: str, new_content_md: str) -> tuple[Document, list[str]]:
+def edit_document(db: Session, doc_id: int, founder_name: str, new_content_md: str,
+                  base_version: int | None = None) -> tuple[Document, list[str]]:
+    """Save a new version. Pass `base_version` (the version the edit was based on) so two
+    founders editing at once cannot silently overwrite each other."""
     doc = db.get(Document, doc_id)
     if not doc:
         raise LookupError("Document not found")
     _require_founder(doc, founder_name)
+    _check_version(doc, base_version, "edit")
     if not new_content_md.strip():
         raise SignOffError("Document content cannot be empty")
     if new_content_md == doc.content_md:
         raise SignOffError("No changes to save")
 
     invalidated = _new_version(db, doc, new_content_md, editor=founder_name, actor=founder_name)
-    db.commit()
+    _commit(db, doc)
     return doc, invalidated

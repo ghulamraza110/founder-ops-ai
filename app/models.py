@@ -65,6 +65,11 @@ class Document(Base):
 
     case: Mapped[StartupCase] = relationship(back_populates="documents")
 
+    # Optimistic locking: every UPDATE runs "... WHERE version = <version we loaded>". If another
+    # request changed the version in between, SQLAlchemy raises StaleDataError instead of
+    # silently overwriting. We bump `version` ourselves (on edit), hence no generator.
+    __mapper_args__ = {"version_id_col": version, "version_id_generator": False}
+
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
